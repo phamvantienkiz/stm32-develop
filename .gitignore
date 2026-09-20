@@ -53,3 +53,12 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# user custom
+.agents/
+.venv/
+
+tasks/lessons.md
+tasks/request.md
+tasks/todo.md
+tasks/workflow.md
