@@ -1,0 +1,9 @@
+C:/Users/ADMIN/STM32Cube/Repository/STM32Cube_FW_F4_V1.28.3/Utilities/Log/lcd_log.c:122:6:LCD_LOG_Init	1
+C:/Users/ADMIN/STM32Cube/Repository/STM32Cube_FW_F4_V1.28.3/Utilities/Log/lcd_log.c:136:6:LCD_LOG_DeInit	1
+C:/Users/ADMIN/STM32Cube/Repository/STM32Cube_FW_F4_V1.28.3/Utilities/Log/lcd_log.c:158:6:LCD_LOG_SetHeader	1
+C:/Users/ADMIN/STM32Cube/Repository/STM32Cube_FW_F4_V1.28.3/Utilities/Log/lcd_log.c:182:6:LCD_LOG_SetFooter	1
+C:/Users/ADMIN/STM32Cube/Repository/STM32Cube_FW_F4_V1.28.3/Utilities/Log/lcd_log.c:206:6:LCD_LOG_ClearTextZone	2
+C:/Users/ADMIN/STM32Cube/Repository/STM32Cube_FW_F4_V1.28.3/Utilities/Log/lcd_log.c:224:1:__io_putchar	11
+C:/Users/ADMIN/STM32Cube/Repository/STM32Cube_FW_F4_V1.28.3/Utilities/Log/lcd_log.c:300:6:LCD_LOG_UpdateDisplay	5
+C:/Users/ADMIN/STM32Cube/Repository/STM32Cube_FW_F4_V1.28.3/Utilities/Log/lcd_log.c:348:13:LCD_LOG_ScrollBack	12
+C:/Users/ADMIN/STM32Cube/Repository/STM32Cube_FW_F4_V1.28.3/Utilities/Log/lcd_log.c:420:13:LCD_LOG_ScrollForward	9
