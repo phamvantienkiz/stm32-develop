@@ -58,7 +58,4 @@ dkms.conf
 .agents/
 .venv/
 
-tasks/lessons.md
-tasks/request.md
-tasks/todo.md
-tasks/workflow.md
+user-tasks/

@@ -1,0 +1,7 @@
+C:/Users/ADMIN/STM32Cube/Repository/STM32Cube_FW_F4_V1.28.3/Drivers/BSP/STM32F429I-Discovery/stm32f429i_discovery_gyroscope.c:79:9:BSP_GYRO_Init	3
+C:/Users/ADMIN/STM32Cube/Repository/STM32Cube_FW_F4_V1.28.3/Drivers/BSP/STM32F429I-Discovery/stm32f429i_discovery_gyroscope.c:170:9:BSP_GYRO_ReadID	2
+C:/Users/ADMIN/STM32Cube/Repository/STM32Cube_FW_F4_V1.28.3/Drivers/BSP/STM32F429I-Discovery/stm32f429i_discovery_gyroscope.c:184:6:BSP_GYRO_Reset	2
+C:/Users/ADMIN/STM32Cube/Repository/STM32Cube_FW_F4_V1.28.3/Drivers/BSP/STM32F429I-Discovery/stm32f429i_discovery_gyroscope.c:197:6:BSP_GYRO_ITConfig	2
+C:/Users/ADMIN/STM32Cube/Repository/STM32Cube_FW_F4_V1.28.3/Drivers/BSP/STM32F429I-Discovery/stm32f429i_discovery_gyroscope.c:222:6:BSP_GYRO_EnableIT	2
+C:/Users/ADMIN/STM32Cube/Repository/STM32Cube_FW_F4_V1.28.3/Drivers/BSP/STM32F429I-Discovery/stm32f429i_discovery_gyroscope.c:239:6:BSP_GYRO_DisableIT	2
+C:/Users/ADMIN/STM32Cube/Repository/STM32Cube_FW_F4_V1.28.3/Drivers/BSP/STM32F429I-Discovery/stm32f429i_discovery_gyroscope.c:251:6:BSP_GYRO_GetXYZ	2
