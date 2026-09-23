@@ -36,3 +36,12 @@
 - Strictly match the existing codebase style, naming conventions, and architecture patterns.
 - If your changes create orphans (unused imports, variables, or functions), remove them immediately. Do not touch pre-existing dead code unless explicitly instructed.
 - Every changed line must trace directly and cleanly back to the user's request.
+
+---
+
+## 3. Python Environment & Script Execution Rules
+
+- **Strict Environment Isolation:** NEVER install Python packages or run Python scripts in the global Windows System Environment. 
+- **Mandatory Use of `uv` or `.venv`:** All Python package installations and script executions MUST happen within an isolated virtual environment (`.venv`) located inside the current workspace.
+- **Verification Before Execution:** Before running any Python-related bash/powershell command, explicitly verify that a local `.venv` exists and is activated, or use the `uv run` / `uv pip` toolchain which automatically handles isolation. If `.venv` is missing, you must create it (`uv venv` or `python -m venv .venv`) before proceeding.
+- **No Global Scope Spillage:** Any command that risks altering the host machine's global configurations or system environment variables is strictly forbidden.
