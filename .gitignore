@@ -54,6 +54,35 @@ dkms.conf
 # debug information files
 *.dwo
 
+# STM32Cube ignore
+
+# Bỏ qua thư mục workspace của IDE
+.metadata/
+    
+# Bỏ qua các thư mục build sinh ra khi compile code
+Debug/
+Release/
+
+# Bỏ qua các file nhị phân và file object
+*.o
+*.elf
+*.bin
+*.hex
+*.map
+*.su
+*.list
+
+# Bỏ qua file cấu hình tạm của CubeMX (có thể tự sinh lại được từ file .ioc)
+*.mxproject
+
+# Bỏ qua các file cấu hình người dùng của IDE
+*.launch
+.settings/
+
+# OS generated files (macOS / Windows)
+.DS_Store
+Thumbs.db
+
 # user custom
 .agents/
 .venv/
