@@ -1,0 +1,844 @@
+# Hướng dẫn tạo nhân vật Pixel Bot có animation trên STM32F429I-DISC1
+
+> Nhân vật gốc: mascot Claude Code (thân chữ nhật, 2 tay ngang, 4 chân, 2 mắt).
+> Đổi màu sang **xanh/tím công nghệ**, hiển thị trên **TFT 240×320 của STM32F429I-DISC1**.
+> Mục tiêu: thử animation **biểu cảm + hành động "cute"**, sau này ghép âm thanh để làm bot AI tương tác với người.
+
+Tài liệu này chỉ tập trung vào **cấu hình pixel, bộ phận, biểu cảm, hành động, bảng frame, và khung code** để bạn viết firmware.
+
+---
+
+## 0. Tóm tắt thiết kế
+
+| Hạng mục              | Giá trị                                                                         |
+| --------------------- | ------------------------------------------------------------------------------- |
+| Màn hình              | 240×320, RGB565, LTDC, framebuffer trong SDRAM                                  |
+| Kích thước sprite gốc | **16 × 10 "ô" (cell)**                                                          |
+| Kích thước 1 ô        | **12 × 12 pixel màn hình** (`CELL = 12`)                                        |
+| Sprite trên màn hình  | 192 × 120 px                                                                    |
+| Lưới cảnh (portrait)  | **20 cột × 26 hàng** ô                                                          |
+| Kiến trúc             | Tách **lớp (layer)**: chân → thân → tay → má hồng → mắt → miệng → hiệu ứng (FX) |
+| Animation             | Mỗi frame = 1 **Pose** (vị trí tay/chân, loại mắt, miệng, FX, thời lượng ms)    |
+| Tốc độ                | Render 30 FPS, double buffer + VSYNC                                            |
+
+Ý tưởng cốt lõi: **không vẽ sprite sheet ảnh lớn**. Nhân vật được ghép từ các bộ phận nhỏ (bitmap vài ô), nên tay/chân/mắt/miệng đổi độc lập, tạo hàng chục biểu cảm và hành động từ rất ít dữ liệu.
+
+---
+
+## 1. Phần cứng và màn hình
+
+| Thông số | STM32F429I-DISC1                                                       |
+| -------- | ---------------------------------------------------------------------- |
+| MCU      | STM32F429ZIT6, 180 MHz, 2 MB Flash, 256 KB RAM                         |
+| LCD      | 2.4" TFT QVGA **240×320** (điều khiển ILI9341, giao tiếp RGB qua LTDC) |
+| SDRAM    | 64 Mbit (8 MB), địa chỉ `0xD0000000`                                   |
+| Nút      | User button **PA0** (xanh dương)                                       |
+| LED      | PG13 (xanh lá), PG14 (đỏ)                                              |
+| Cảm ứng  | STMPE811 (I²C)                                                         |
+| Gyro     | L3GD20 (SPI)                                                           |
+
+### 1.1 Định dạng pixel và bộ nhớ
+
+- Dùng **RGB565** (16 bit/pixel). Một framebuffer = `240 × 320 × 2 = 153 600 byte = 0x25800`.
+- RAM nội 256 KB **không đủ** cho 2 framebuffer, nên đặt cả hai trong **SDRAM**:
+  - `FB0 = 0xD0000000`
+  - `FB1 = 0xD0000000 + 0x25800 = 0xD0025800`
+- F429 **không có D-cache**, nên không cần clean/invalidate cache khi CPU ghi framebuffer.
+
+### 1.2 Hướng màn hình
+
+Màn hình gốc là **portrait 240×320**. Bản hướng dẫn này dùng portrait (không cần xoay).
+Nếu muốn landscape (320×240, 26 cột × 20 hàng), xoay ở hàm `cell_fill()` bằng cách đổi `(x,y) → (y, 239-x)`. Landscape có nhiều chỗ hơn để nhân vật đi ngang.
+
+---
+
+## 2. Lưới pixel và bố cục cảnh
+
+### 2.1 Phân tích sprite gốc (từ ảnh 3)
+
+Đo trên ảnh: 1 ô ≈ 28 px ảnh. Kết quả lưới **16 × 10**:
+
+- Thân: cột 2–13, hàng 0–7 (**12 × 8**)
+- Tay: 2 khối **2 × 2** ở cột 0–1 và 14–15, hàng 4–5
+- Mắt: 2 lỗ **1 × 2** ở cột 4 và 11, hàng 2–3
+- Chân: 4 cột **1 × 2** ở cột 3, 5, 10, 12, hàng 8–9
+- Nhân vật **đối xứng trái–phải** (`cột + cột_đối = 15`)
+
+### 2.2 Sprite tham chiếu (B=thân, E=mắt, A=tay, L=chân)
+
+```
+cột:  0123456789012345
+h0    ..BBBBBBBBBBBB..
+h1    ..BBBBBBBBBBBB..
+h2    ..BBEBBBBBBEBB..
+h3    ..BBEBBBBBBEBB..
+h4    AABBBBBBBBBBBBAA
+h5    AABBBBBBBBBBBBAA
+h6    ..BBBBBBBBBBBB..
+h7    ..BBBBBBBBBBBB..
+h8    ...L.L....L.L...
+h9    ...L.L....L.L...
+```
+
+### 2.3 Bố cục trên màn hình portrait (20 × 26 ô)
+
+```
+CELL   = 12 px
+COLS   = 20   (240 / 12)
+ROWS   = 26   (312 px, dư 8 px dưới cùng)
+
+Gốc nhân vật (char origin) = ô (CHAR_X=2, CHAR_Y=10)
+  -> sprite chiếm cột 2..17, hàng 10..19
+  -> mặt đất (ground) ở hàng 20, đổ bóng ở đây
+
+Hàng 0..9   : vùng FX phía trên (tim, "?", "!", Zzz, sao...)
+Hàng 10..19 : nhân vật
+Hàng 20     : bóng đổ (shadow)
+Hàng 21..25 : vùng trống (text trạng thái sau này)
+```
+
+> Mọi tọa độ trong tài liệu này là **tọa độ cục bộ** (local) so với gốc nhân vật, tính bằng ô. Ô màn hình = `CHAR_X + x_local`, `CHAR_Y + y_local`. Giá trị âm = lên trên / sang trái gốc.
+
+---
+
+## 3. Bảng màu (xanh/tím công nghệ)
+
+Nền tối để thân tím nổi bật, mắt tối (hoặc phát sáng cyan khi "đang nghe").
+
+| Tên         | HEX       | RGB565   | Vai trò                                    |
+| ----------- | --------- | -------- | ------------------------------------------ |
+| `C_BG`      | `#0D0B1E` | `0x0843` | Nền                                        |
+| `C_SHADOW`  | `#1A1538` | `0x18A7` | Bóng đổ dưới đất                           |
+| `C_BODY`    | `#7B61FF` | `0x7B1F` | Thân (tím chính)                           |
+| `C_BODY_HI` | `#9D8CFF` | `0x9C7F` | Hàng trên cùng của thân (sáng)             |
+| `C_BODY_SH` | `#5B45D6` | `0x5A3A` | Hàng dưới cùng thân, chân, tay đè lên thân |
+| `C_EYE`     | `#120B2E` | `0x1045` | Mắt, miệng (tối)                           |
+| `C_CYAN`    | `#22D3EE` | `0x269D` | Mắt phát sáng, sóng âm, dấu "…"            |
+| `C_PINK`    | `#FF6BD6` | `0xFB5A` | Má hồng, lưỡi                              |
+| `C_HEART`   | `#FF4D8D` | `0xFA71` | Trái tim                                   |
+| `C_YELLOW`  | `#FFD93D` | `0xFEC7` | Sao, lấp lánh                              |
+| `C_TEAR`    | `#5AA9FF` | `0x5D5F` | Nước mắt                                   |
+| `C_RED`     | `#FF3B3B` | `0xF9C7` | Dấu giận                                   |
+| `C_WHITE`   | `#FFFFFF` | `0xFFFF` | Dự phòng                                   |
+
+Công thức đổi HEX → RGB565: `((R>>3)<<11) | ((G>>2)<<5) | (B>>3)`.
+
+Muốn giống bản gốc phẳng 100%: đặt `C_BODY_HI = C_BODY_SH = C_BODY`.
+Muốn đổi theme sang xanh dương: thay `C_BODY` bằng `#3B82F6`, `C_BODY_HI` bằng `#7DB4FF`, `C_BODY_SH` bằng `#2458C7` (tự đổi sang RGB565).
+
+---
+
+## 4. Kiến trúc lớp (layer) và thứ tự vẽ
+
+Vẽ từ dưới lên trên:
+
+| #   | Lớp     | Ghi chú                                             |
+| --- | ------- | --------------------------------------------------- |
+| 1   | Nền     | `fb_clear(C_BG)`                                    |
+| 2   | Bóng đổ | Co nhỏ khi nhảy cao                                 |
+| 3   | Chân    | 4 chân, mỗi chân cao 0–2 ô                          |
+| 4   | Thân    | Hàng trên `HI`, hàng dưới `SH`, còn lại `BODY`      |
+| 5   | Tay     | Nếu ô tay đè lên thân → dùng `C_BODY_SH` để thấy rõ |
+| 6   | Má hồng | 2 × 2 ô hồng                                        |
+| 7   | Mắt     | Bitmap 3×4 mỗi mắt (mắt phải = lật ngang mắt trái)  |
+| 8   | Miệng   | Bitmap 4×3                                          |
+| 9   | FX      | Tim, Zzz, "?", "!", sao, nước mắt...                |
+
+### 4.1 Tham số pose toàn thân
+
+| Tham số                 | Ý nghĩa                                                                |
+| ----------------------- | ---------------------------------------------------------------------- |
+| `dx, dy`                | Dịch cả nhân vật (ô). `dy < 0` = lên trên. Bóng đổ **không** dịch theo |
+| `stretch` ∈ {-1, 0, +1} | -1 = **squash** (lùn xuống), +1 = **stretch** (cao lên)                |
+| `upper_dy = -stretch`   | Phần trên (mắt, miệng, tay, má) dịch theo chiều cao thân               |
+
+Thân: hàng từ `top = -stretch` đến `7` (đáy luôn cố định ở hàng 7, chân không bị ảnh hưởng).
+
+### 4.2 Điểm neo (anchor) của từng bộ phận (tọa độ local)
+
+| Bộ phận      | Neo                         | Kích thước        |
+| ------------ | --------------------------- | ----------------- |
+| Thân         | cột 2..13, hàng `top..7`    | 12 × (8+stretch)  |
+| Mắt trái     | (3, 1 + upper_dy)           | 3 × 4             |
+| Mắt phải     | (10, 1 + upper_dy)          | 3 × 4 (lật ngang) |
+| Miệng        | (6, 4 + upper_dy)           | 4 × 3             |
+| Má hồng trái | ô (3,4), (4,4) + upper_dy   | 2 × 1             |
+| Má hồng phải | ô (11,4), (12,4) + upper_dy | 2 × 1             |
+| Tay trái     | gốc (0, 4 + upper_dy)       | 2 × 2             |
+| Tay phải     | gốc (14, 4 + upper_dy)      | 2 × 2             |
+| Chân         | cột 3, 5, 10, 12 · hàng 8   | 1 × (0..2)        |
+
+Thứ tự chân: `LL`=cột 3, `LI`=cột 5, `RI`=cột 10, `RO`=cột 12.
+
+---
+
+## 5. Thư viện bộ phận (bitmap ASCII)
+
+Quy ước: `#` = pixel bật, `.` = trong suốt, `P` = màu hồng (chỉ miệng).
+
+### 5.1 Mắt (3 cột × 4 hàng, vẽ cho **mắt trái**)
+
+Mắt phải = **lật ngang** bitmap (ví dụ `SQUINT` bên trái là `>`, bên phải tự thành `<`).
+
+```
+NORMAL   HALF     CLOSED   HAPPY    SQUINT   WIDE
+...      ...      ...      .#.      ...      .#.
+.#.      ...      ...      #.#      #..      .#.
+.#.      .#.      ###      ...      .#.      .#.
+...      ...      ...      ...      #..      .#.
+```
+
+```
+HEART    SPARKLE  ANGRY    SAD
+...      ...      ##.      ..#
+#.#      .#.      .#.      .#.
+###      ###      .#.      .#.
+.#.      .#.      ...      ...
+```
+
+Mắt **DIZZY** (xoáy, lấy cảm hứng từ ảnh 2): 4 frame xoay vòng, mỗi frame 120 ms:
+
+```
+DIZZY0   DIZZY1   DIZZY2   DIZZY3
+...      ...      ...      ...
+#.#      ###      ###      ###
+#.#      #..      #.#      ..#
+###      ###      #.#      ###
+```
+
+Ghi chú sử dụng:
+
+- `NORMAL` là mắt gốc (1×2 ô). Có thể **nhìn quanh** bằng `eyeDx, eyeDy ∈ {-1,0,+1}` (dịch bitmap trong vùng 3×4, chỉ áp dụng cho `NORMAL`, `WIDE`).
+- `SQUINT` tương ứng ảnh 1 (mắt `> <`): dùng cho cười ré / nhắm tịt.
+- Mắt `HEART` và `SPARKLE` tự đổi màu: tim = `C_HEART`, lấp lánh = `C_YELLOW`.
+- Mắt còn lại dùng `eyeColor`: `0 = C_EYE` (tối), `1 = C_CYAN` (phát sáng khi đang nghe).
+
+### 5.2 Miệng (4 × 3, neo (6, 4))
+
+Nhân vật gốc **không có miệng**, nên trạng thái `NONE` là bản gốc. Miệng chỉ xuất hiện khi cần biểu cảm.
+
+```
+SMILE    OPEN     O        FLAT     FROWN
+#..#     ####     ....     ....     ....
+.##.     #PP#     .##.     .##.     .##.
+....     .##.     .##.     ....     #..#
+```
+
+### 5.3 Tay (khối 2 × 2)
+
+Tay có 2 tham số `(in, dy)`:
+
+- `in`: dịch **vào trong** về phía thân (dương = vào trong, âm = ra ngoài), áp dụng đối xứng cho cả hai tay.
+- `dy`: dịch dọc (âm = giơ lên).
+
+| Tư thế                   | `(in, dy)` | Hàng chiếm         |
+| ------------------------ | ---------- | ------------------ |
+| Nghỉ (gốc)               | (0, 0)     | 4–5                |
+| Buông thấp               | (0, +1)    | 5–6                |
+| Buông xuống hẳn          | (0, +2)    | 6–7                |
+| Giơ nhẹ                  | (0, -1)    | 3–4                |
+| Giơ cao                  | (0, -2)    | 2–3                |
+| Giơ rất cao (vẫy)        | (-1, -3)   | 1–2, lệch ra ngoài |
+| Ôm sát người             | (+1, 0)    | 4–5, đè lên thân   |
+| Tay chống cằm (suy nghĩ) | (+1, -1)   | 3–4                |
+
+Quy tắc vẽ: ô tay nào đè lên ô thân thì tô `C_BODY_SH`.
+
+### 5.4 Chân (mỗi chân cột rộng 1, cao 0–2)
+
+Mã hóa 4 chân vào 1 byte: `LEGS(LL, LI, RI, RO)`, mỗi chân 2 bit (chiều cao 0–2).
+
+- `2222`: đứng bình thường
+- `1212`: nhấc cặp (LL, RI) lên, đang bước
+- `2121`: nhấc cặp (LI, RO)
+- `1111`: co chân (đang nhảy)
+
+### 5.5 Hiệu ứng (FX)
+
+```
+HEART(5x5)  QUESTION(3x5) EXCL(1x5)  Z(3x3)   SPARK(3x3) WAVE(2x5)  ANGER(4x4)
+.#.#.       ###           #          ###      .#.        #.         #..#
+#####       ..#           #          .#.      ###        .#         .##.
+#####       .#.           #          ###      .#.        .#         .##.
+.###.       ...           .                              .#         #..#
+..#..       .#.           #                              #.
+```
+
+Tim: `C_HEART`, `?` và `!`: `C_YELLOW`, `Z`: `C_CYAN`, sao: `C_YELLOW`, sóng âm: `C_CYAN`, dấu giận: `C_RED`.
+Nước mắt: khối **1 × 2** `C_TEAR`. Dấu "…": 3 ô 1×1 màu `C_CYAN`.
+
+Vị trí và chuyển động của FX (tọa độ local):
+
+| FX               | Vị trí / chuyển động                                                                  | Thời gian sống         |
+| ---------------- | ------------------------------------------------------------------------------------- | ---------------------- |
+| Tim              | Sinh ở (6,-2), bay lên tới (6,-8), lắc x ±1 mỗi 250 ms. Tối đa 3 tim                  | 1.5 s / tim            |
+| Zzz              | 3 chữ Z lần lượt ở (12,-1) → (13,-3) → (14,-5), mỗi 600 ms hiện thêm 1 chữ, rồi reset | vòng lặp               |
+| Lấp lánh         | Ngẫu nhiên quanh đầu, nhấp nháy 2 frame                                               | 250 ms                 |
+| Nước mắt         | Ở cột 4 (trái) và 11 (phải), hàng 4 → rơi xuống hàng 7 mỗi 120 ms rồi lặp             | lặp                    |
+| `?`              | Ở (13,-3), nhấp nhô lên xuống 1 ô mỗi 400 ms                                          | đến khi đổi trạng thái |
+| `!`              | Ở (8,-6), bật lên 1 lần rồi đứng yên                                                  | 600 ms                 |
+| Dấu giận         | Ở (12,-2), nhấp nháy mỗi 200 ms                                                       | đến khi đổi trạng thái |
+| Dấu "…"          | (12,-2), (14,-2), (16,-2) lần lượt hiện mỗi 300 ms                                    | lặp                    |
+| Sóng âm          | Trái: (-2, 2), phải: (16, 2), 2 frame nhấp nháy luân phiên mỗi 250 ms                 | khi lắng nghe          |
+| Sao xoay (dizzy) | 2 sao quay elip quanh (8,-3), 4 bước: (3,-3) → (8,-4) → (13,-3) → (8,-2)              | lặp                    |
+
+### 5.6 Bóng đổ
+
+Hàng `ground = CHAR_Y + 10`. Độ rộng thay đổi theo độ cao nhảy `h = -dy`:
+
+| `h` | Rộng (ô) | Cột local |
+| --- | -------- | --------- |
+| 0–1 | 12       | 3..14     |
+| 2–3 | 10       | 4..13     |
+| ≥ 4 | 8        | 5..12     |
+
+---
+
+## 6. Mô hình Pose / Frame
+
+Một animation = mảng các `Pose`. Mỗi Pose mô tả **toàn bộ** vẻ ngoài tại một thời điểm.
+
+```c
+typedef struct {
+    int8_t   dx, dy;            // dịch cả nhân vật (ô)
+    int8_t   stretch;           // -1, 0, +1
+    int8_t   aL_in, aL_dy;      // tay trái  (in, dy)
+    int8_t   aR_in, aR_dy;      // tay phải
+    uint8_t  legs;              // LEGS(LL,LI,RI,RO)
+    uint8_t  eyeL, eyeR;        // EyeId
+    int8_t   eyeDx, eyeDy;      // nhìn quanh
+    uint8_t  eyeColor;          // 0 tối, 1 cyan
+    uint8_t  mouth;             // MouthId
+    uint8_t  blush;             // 0/1
+    uint8_t  fx;                // FxId
+    uint16_t ms;                // thời lượng frame
+} Pose;
+```
+
+Quy tắc ưu tiên khi chồng lớp (thấp → cao):
+
+1. **Base emotion** (biểu cảm nền, mục 8)
+2. **Action frame** (hành động, mục 9) ghi đè các trường nó đặt
+3. **Overlay** (chớp mắt, nhìn quanh, nói nhép miệng...)
+
+---
+
+## 7. Dữ liệu bitmap trong C
+
+Mỗi hàng bitmap là 1 byte, bit cao nhất = cột trái nhất.
+
+```c
+typedef struct { uint8_t w, h; const uint8_t *row; } Bmp;   // bit (w-1-x) = cột x
+
+static const uint8_t EYE_NORMAL_ROWS[4] = {0b000, 0b010, 0b010, 0b000};
+static const uint8_t EYE_HAPPY_ROWS [4] = {0b010, 0b101, 0b000, 0b000};
+static const uint8_t EYE_SQUINT_ROWS[4] = {0b000, 0b100, 0b010, 0b100};  // ">"
+static const uint8_t MOUTH_SMILE_ROWS[3] = {0b1001, 0b0110, 0b0000};
+
+static const Bmp EYE_NORMAL  = {3, 4, EYE_NORMAL_ROWS};
+static const Bmp EYE_HAPPY   = {3, 4, EYE_HAPPY_ROWS};
+static const Bmp EYE_SQUINT  = {3, 4, EYE_SQUINT_ROWS};
+static const Bmp MOUTH_SMILE = {4, 3, MOUTH_SMILE_ROWS};
+```
+
+### Script Python: ASCII → mảng C
+
+Viết bitmap ở file `sprites.txt` theo dạng: dòng tiêu đề `NAME W H`, theo sau là H dòng ASCII.
+
+```
+EYE_HAPPY 3 4
+.#.
+#.#
+...
+...
+```
+
+```python
+# ascii2c.py  -  python ascii2c.py sprites.txt > sprites.h
+import sys
+lines = [l.rstrip("\n") for l in open(sys.argv[1]) if l.strip()]
+i = 0
+while i < len(lines):
+    name, w, h = lines[i].split(); w, h = int(w), int(h); i += 1
+    rows = []
+    for r in range(h):
+        bits = 0
+        for c, ch in enumerate(lines[i + r]):
+            if ch != ".":
+                bits |= 1 << (w - 1 - c)
+        rows.append("0b" + format(bits, f"0{w}b"))
+    i += h
+    print(f"static const uint8_t {name}_ROWS[{h}] = {{{', '.join(rows)}}};")
+    print(f"static const Bmp {name} = {{{w}, {h}, {name}_ROWS}};")
+```
+
+---
+
+## 8. Biểu cảm (Emotion presets, tư thế nền)
+
+| Biểu cảm      | Mắt                                        | Miệng                                | Má  | Tay L / R `(in,dy)`       | Thân                       | FX                      |
+| ------------- | ------------------------------------------ | ------------------------------------ | --- | ------------------------- | -------------------------- | ----------------------- |
+| **NEUTRAL**   | NORMAL                                     | NONE                                 | 0   | (0,0) / (0,0)             | st 0                       | —                       |
+| **HAPPY**     | HAPPY                                      | SMILE                                | 1   | (0,-1) / (0,-1)           | st 0                       | lấp lánh                |
+| **EXCITED**   | SPARKLE                                    | OPEN                                 | 1   | (0,-2) / (0,-2)           | st +1                      | lấp lánh                |
+| **LOVE**      | HEART                                      | SMILE                                | 1   | (+1,0) / (+1,0)           | st 0                       | tim bay                 |
+| **SAD**       | SAD                                        | FROWN                                | 0   | (0,+2) / (0,+2)           | st -1                      | —                       |
+| **CRY**       | SAD                                        | FROWN                                | 0   | (0,+1) / (0,+1)           | st -1                      | nước mắt (+ rung dy ±1) |
+| **ANGRY**     | ANGRY                                      | FLAT                                 | 0   | (0,+1) / (0,+1)           | st 0                       | dấu giận (+ rung dx ±1) |
+| **SURPRISED** | WIDE                                       | O                                    | 0   | (0,-1) / (0,-1)           | st +1                      | `!`                     |
+| **SLEEP**     | CLOSED                                     | NONE                                 | 0   | (0,+2) / (0,+2)           | st -1                      | Zzz                     |
+| **THINKING**  | NORMAL (nhìn lên-phải: eyeDx +1, eyeDy -1) | FLAT                                 | 0   | (0,0) / (+1,-1)           | st 0                       | "…"                     |
+| **CONFUSED**  | L: NORMAL, R: HALF                         | FROWN                                | 0   | (0,0) / (0,-1)            | st 0                       | `?`                     |
+| **DIZZY**     | DIZZY (xoay 4 frame)                       | FLAT                                 | 0   | (0,+1) / (0,+1)           | st 0, dx lắc ±1 mỗi 200 ms | sao xoay                |
+| **LAUGH**     | SQUINT (`> <`)                             | OPEN                                 | 1   | (0,-1) / (0,0) luân phiên | st 0, dy bật ±1 mỗi 120 ms | —                       |
+| **WINK**      | L: NORMAL, R: HAPPY                        | SMILE                                | 1   | (0,0) / (0,0)             | st 0                       | lấp lánh                |
+| **LISTENING** | NORMAL, `eyeColor = cyan`                  | NONE                                 | 0   | (0,-1) / (0,-1)           | st 0                       | sóng âm 2 bên           |
+| **SPEAKING**  | NORMAL hoặc HAPPY                          | **theo biên độ âm thanh** (mục 11.2) | 0/1 | (0,0) / (0,0), hơi nhún   | st 0                       | —                       |
+
+Chân của mọi biểu cảm nền mặc định là `2222`.
+
+---
+
+## 9. Hành động (Action animations)
+
+Ký hiệu: `body` = `dx,dy,stretch`; tay = `(in,dy)`; chân = `LEGS`; `—` = giữ nguyên biểu cảm nền.
+
+### 9.1 IDLE thở (loop, luôn chạy khi rảnh)
+
+| #   | ms  | body  | Tay L  | Tay R  | Chân | Mắt    | Miệng |
+| --- | --- | ----- | ------ | ------ | ---- | ------ | ----- |
+| 1   | 900 | 0,0,0 | (0,0)  | (0,0)  | 2222 | NORMAL | NONE  |
+| 2   | 900 | 0,0,0 | (0,+1) | (0,+1) | 2222 | NORMAL | NONE  |
+
+**Nhìn quanh** (chèn ngẫu nhiên mỗi 8–15 s): `eyeDx = -1` (500 ms) → `+1` (500 ms) → `0` (300 ms).
+Nguyên tắc: nhân vật **không đứng yên hoàn toàn quá 1 giây**, nếu không sẽ trông như bị treo.
+
+### 9.2 BLINK (overlay, chèn lên mọi trạng thái có mắt NORMAL)
+
+| Bước | Mắt            | ms  |
+| ---- | -------------- | --- |
+| 1    | HALF           | 50  |
+| 2    | CLOSED         | 80  |
+| 3    | HALF           | 50  |
+| 4    | trả lại mắt cũ | —   |
+
+Khoảng cách giữa 2 lần chớp: ngẫu nhiên 2500–5500 ms; **15% xác suất chớp đôi** (2 lần cách nhau 150 ms). Không chớp khi mắt là HEART, SQUINT, DIZZY, CLOSED.
+
+### 9.3 WAVE, vẫy tay chào
+
+| #   | ms  | Tay R `(in,dy)` | Mắt   | Miệng | Má  |
+| --- | --- | --------------- | ----- | ----- | --- |
+| 1   | 100 | (0,-1)          | HAPPY | SMILE | 1   |
+| 2   | 140 | (0,-2)          | HAPPY | SMILE | 1   |
+| 3   | 140 | (-1,-3)         | HAPPY | SMILE | 1   |
+| 4   | 140 | (0,-2)          | HAPPY | SMILE | 1   |
+| 5   | 140 | (-1,-3)         | HAPPY | SMILE | 1   |
+| 6   | 140 | (0,-2)          | HAPPY | SMILE | 1   |
+| 7   | 140 | (-1,-3)         | HAPPY | SMILE | 1   |
+| 8   | 100 | (0,-1)          | HAPPY | SMILE | 1   |
+
+Tay L giữ (0,0). Lặp frame 2–7 thêm nếu muốn vẫy lâu hơn. Kết thúc → về IDLE.
+
+### 9.3b WALK, đi tại chỗ (loop, 4 frame × 110 ms)
+
+| #   | body   | Tay L  | Tay R  | Chân |
+| --- | ------ | ------ | ------ | ---- |
+| 1   | 0,0,0  | (0,+1) | (0,-1) | 1212 |
+| 2   | 0,-1,0 | (0,0)  | (0,0)  | 2222 |
+| 3   | 0,0,0  | (0,-1) | (0,+1) | 2121 |
+| 4   | 0,-1,0 | (0,0)  | (0,0)  | 2222 |
+
+- Mắt `NORMAL` với `eyeDx = ±1` theo hướng đi.
+- Nhân vật **đối xứng** nên không cần lật sprite khi đổi hướng.
+- Màn hình portrait chỉ còn dư 2 ô mỗi bên, nên **đi tại chỗ** và **cuộn nền** (các chấm/vạch mặt đất trượt ngược lại) để tạo cảm giác di chuyển. Landscape mới có chỗ tịnh tiến thật (`dx` ∈ [-4, +4]).
+
+### 9.4 JUMP (không loop, 7 frame)
+
+| #         | ms  | body `dx,dy,st` | Tay L  | Tay R  | Chân | Mắt    | Miệng |
+| --------- | --- | --------------- | ------ | ------ | ---- | ------ | ----- |
+| 1 Dồn lực | 120 | 0,0,-1          | (0,+1) | (0,+1) | 2222 | NORMAL | NONE  |
+| 2 Bật lên | 80  | 0,-2,+1         | (0,-2) | (0,-2) | 1111 | WIDE   | O     |
+| 3 Bay     | 100 | 0,-4,0          | (0,-2) | (0,-2) | 1111 | HAPPY  | OPEN  |
+| 4 Đỉnh    | 140 | 0,-5,0          | (0,-2) | (0,-2) | 1111 | HAPPY  | OPEN  |
+| 5 Rơi     | 80  | 0,-2,+1         | (0,-1) | (0,-1) | 2222 | NORMAL | O     |
+| 6 Đáp     | 100 | 0,0,-1          | (0,+1) | (0,+1) | 2222 | CLOSED | NONE  |
+| 7 Hồi     | 100 | 0,0,0           | (0,0)  | (0,0)  | 2222 | HAPPY  | SMILE |
+
+Đây là cặp **anticipation** (dồn lực trước khi bật) và **squash khi đáp**, yếu tố quan trọng nhất làm chuyển động "đàn hồi, dễ thương". Bóng đổ co nhỏ dần khi lên cao (mục 5.6).
+
+### 9.5 DANCE (loop 4 frame × 250 ms, ~120 BPM nửa nhịp)
+
+| #   | body    | Tay L  | Tay R  | Chân | Mắt   | Miệng |
+| --- | ------- | ------ | ------ | ---- | ----- | ----- |
+| A   | -1,0,0  | (0,-2) | (0,+1) | 1222 | HAPPY | OPEN  |
+| B   | 0,-1,+1 | (0,-2) | (0,-2) | 1111 | HAPPY | OPEN  |
+| C   | +1,0,0  | (0,+1) | (0,-2) | 2221 | HAPPY | OPEN  |
+| D   | 0,-1,+1 | (0,-2) | (0,-2) | 1111 | HAPPY | OPEN  |
+
+Má hồng = 1, thêm lấp lánh ngẫu nhiên. Sau này đồng bộ frame với **nhịp nhạc** (mục 11.3).
+
+### 9.6 BOOT / WAKE-UP (chạy 1 lần khi khởi động)
+
+| #   | ms  | Trạng thái                                           |
+| --- | --- | ---------------------------------------------------- |
+| 1   | 500 | SLEEP (mắt CLOSED, tay (0,+2), st -1)                |
+| 2   | 150 | Mắt HALF                                             |
+| 3   | 200 | Mắt NORMAL, nhìn trái (`eyeDx -1`)                   |
+| 4   | 250 | Nhìn phải (`eyeDx +1`)                               |
+| 5   | 300 | **Vươn vai**: st +1, tay (0,-2), mắt CLOSED, miệng O |
+| 6   | 150 | Hồi: st -1 → 0, mắt NORMAL                           |
+| 7   | —   | Chạy **WAVE**                                        |
+
+### 9.7 POKE (phản ứng khi chạm màn hình)
+
+| #   | ms  | Trạng thái                                                    |
+| --- | --- | ------------------------------------------------------------- |
+| 1   | 80  | st +1, dy -1, mắt WIDE, miệng O, FX `!`                       |
+| 2   | 120 | st -1, dy 0, mắt NORMAL                                       |
+| 3   | 700 | HAPPY + blush, hoặc LAUGH nếu chạm liên tục ≥ 3 lần trong 2 s |
+
+### 9.8 ANGRY shake (loop)
+
+`dx` luân phiên `-1, +1` mỗi **50 ms**, mắt ANGRY, miệng FLAT, dấu giận nhấp nháy.
+
+---
+
+## 10. Nguyên tắc animation để "cute"
+
+1. **Hold key-pose lâu hơn, đổi nhanh giữa các pose.** Pixel art không nội suy nên hãy kéo dài pose đẹp (120–900 ms) và chuyển giữa chúng chỉ 1 frame (ease-in/out).
+2. **Anticipation + squash/stretch.** Trước khi bật nhảy phải lùn xuống, khi đáp phải lùn xuống lần nữa.
+3. **Overshoot.** Tay giơ cao hơn đích 1 ô (`-3`) rồi hạ về (`-2`), như vẫy tay.
+4. **Follow-through.** Tay đổi tư thế chậm hơn thân **1 frame**.
+5. **Mắt quyết định cảm xúc.** Chỉ cần đổi mắt + miệng là đủ thay đổi biểu cảm, còn tay/chân tăng độ sống động.
+6. **Bất đối xứng nhẹ.** Mắt trái NORMAL, mắt phải HAPPY (WINK), hoặc một tay giơ cao hơn, trông "có tính cách" hơn so với đối xứng tuyệt đối.
+7. **Má hồng** bật khi vui/yêu/ngại, là mẹo rẻ nhất để thêm "dễ thương".
+8. **Nhịp sống:** thở 1.8 s/chu kỳ, chớp mắt 2.5–5.5 s, nhìn quanh 8–15 s.
+9. **Giữ ≤ 6 màu đồng thời** trên nhân vật để giữ phong cách pixel rõ ràng.
+10. **Dùng ô 12 px nhất quán.** Không trộn nửa ô (6 px) trừ khi cố ý làm chuyển động siêu nhẹ.
+
+---
+
+## 11. Bộ máy trạng thái và tích hợp âm thanh
+
+### 11.1 Mức ưu tiên
+
+| Mức | Loại        | Ví dụ               |
+| --- | ----------- | ------------------- |
+| 0   | Idle        | thở, nhìn quanh     |
+| 1   | Emotion nền | HAPPY, SAD, LOVE... |
+| 2   | Action      | WAVE, JUMP, DANCE   |
+| 3   | Phản ứng    | POKE, SHAKE (gyro)  |
+| 4   | Hệ thống    | BOOT, lỗi           |
+
+Mức cao ngắt mức thấp. Khi action/phản ứng kết thúc → **quay về Emotion nền** hiện tại (không về NEUTRAL).
+
+### 11.2 Nói nhép miệng theo âm thanh (SPEAKING)
+
+Cứ 60–80 ms đọc biên độ RMS đã chuẩn hóa `a ∈ [0,1]` của âm thanh đang phát:
+
+| Biên độ `a`   | Miệng |
+| ------------- | ----- |
+| `< 0.08`      | FLAT  |
+| `0.08 – 0.30` | O     |
+| `> 0.30`      | OPEN  |
+
+Dùng **hysteresis** (giữ trạng thái tối thiểu 60 ms) để miệng không nháy loạn. Sau này nâng cấp lên **viseme** theo phoneme của TTS nếu cần.
+
+### 11.3 Các sự kiện AI → animation (gợi ý)
+
+| Sự kiện                        | Phản ứng                       |
+| ------------------------------ | ------------------------------ |
+| Thức dậy / phát hiện wake-word | BOOT → WAVE                    |
+| Người đang nói (VAD)           | LISTENING (mắt cyan + sóng âm) |
+| Đang suy nghĩ / chờ model      | THINKING                       |
+| Đang phát TTS                  | SPEAKING                       |
+| Câu trả lời vui                | HAPPY / LAUGH                  |
+| Không hiểu                     | CONFUSED                       |
+| Khen bot                       | LOVE hoặc WINK                 |
+| Lỗi mạng / lỗi                 | SAD hoặc DIZZY                 |
+| Phát nhạc                      | DANCE (đồng bộ beat)           |
+| Im lặng lâu (> 60 s)           | SLEEP                          |
+
+> Lưu ý phần cứng âm thanh: board STM32F429I-DISC1 **không có codec/mic** sẵn. Sau này cần gắn thêm module I²S (ví dụ mic INMP441 + amp MAX98357A) qua chân I²S/SAI của board.
+
+---
+
+## 12. Render pipeline và khung code C
+
+### 12.1 Cấu hình
+
+```c
+#define SCR_W     240
+#define SCR_H     320
+#define CELL      12
+#define COLS      (SCR_W / CELL)   // 20
+#define ROWS      (SCR_H / CELL)   // 26
+#define CHAR_X    2
+#define CHAR_Y    10
+#define GROUND_ROW (CHAR_Y + 10)
+
+#define FB_SIZE   (SCR_W * SCR_H * 2)      // 153600 = 0x25800
+#define FB0_ADDR  0xD0000000UL
+#define FB1_ADDR  (FB0_ADDR + FB_SIZE)
+
+#define C_BG       0x0843
+#define C_SHADOW   0x18A7
+#define C_BODY     0x7B1F
+#define C_BODY_HI  0x9C7F
+#define C_BODY_SH  0x5A3A
+#define C_EYE      0x1045
+#define C_CYAN     0x269D
+#define C_PINK     0xFB5A
+#define C_HEART    0xFA71
+#define C_YELLOW   0xFEC7
+#define C_TEAR     0x5D5F
+#define C_RED      0xF9C7
+```
+
+### 12.2 Khởi tạo LCD (dùng BSP của STM32CubeF4)
+
+```c
+BSP_LCD_Init();                                          // khởi tạo LTDC + SDRAM + ILI9341
+BSP_LCD_LayerDefaultInit(LCD_BACKGROUND_LAYER, FB0_ADDR);
+BSP_LCD_SelectLayer(LCD_BACKGROUND_LAYER);
+```
+
+- `BSP_LCD_Init()` trong BSP của F429I-DISCO cũng khởi tạo SDRAM (`BSP_SDRAM_Init`). Nếu dùng CubeMX/HAL thuần thì cấu hình **FMC SDRAM Bank 2** và **LTDC Layer 1 RGB565 240×320** tương ứng.
+- Kiểm tra tên handle LTDC: BSP dùng `LtdcHandler`, CubeMX dùng `hltdc`.
+
+### 12.3 Primitives
+
+```c
+static uint16_t *back;                       // framebuffer đang vẽ
+static uint16_t *front;                      // framebuffer đang hiển thị
+
+static void fb_clear(uint16_t *fb, uint16_t c) {
+    uint32_t v = c | ((uint32_t)c << 16);
+    uint32_t *p = (uint32_t *)fb;
+    for (int i = 0; i < SCR_W * SCR_H / 2; i++) p[i] = v;
+}
+
+static inline void cell_fill(uint16_t *fb, int cx, int cy, uint16_t c) {
+    if ((unsigned)cx >= COLS || (unsigned)cy >= ROWS) return;   // clip
+    uint16_t *p = fb + (cy * CELL) * SCR_W + cx * CELL;
+    for (int y = 0; y < CELL; y++, p += SCR_W)
+        for (int x = 0; x < CELL; x++) p[x] = c;
+}
+
+static inline uint16_t cell_get(const uint16_t *fb, int cx, int cy) {
+    return fb[(cy * CELL) * SCR_W + cx * CELL];
+}
+
+static void draw_bmp(uint16_t *fb, const Bmp *b, int cx, int cy,
+                     uint16_t color, int flipX) {
+    for (int y = 0; y < b->h; y++)
+        for (int x = 0; x < b->w; x++) {
+            int bit = flipX ? x : (b->w - 1 - x);
+            if (b->row[y] & (1 << bit)) cell_fill(fb, cx + x, cy + y, color);
+        }
+}
+```
+
+### 12.4 Vẽ nhân vật
+
+```c
+#define LEG_H(legs, i)  (((legs) >> (2 * (i))) & 3)
+static const uint8_t LEG_COL[4] = {3, 5, 10, 12};
+
+static void draw_arm(uint16_t *fb, int left, int in, int dy, int ox, int oy) {
+    int x0 = left ? (0 + in) : (14 - in);
+    for (int j = 0; j < 2; j++)
+        for (int i = 0; i < 2; i++) {
+            int cx = CHAR_X + ox + x0 + i, cy = CHAR_Y + oy + 4 + dy + j;
+            uint16_t under = cell_get(fb, cx, cy);
+            cell_fill(fb, cx, cy,
+                      (under == C_BODY || under == C_BODY_HI || under == C_BODY_SH)
+                      ? C_BODY_SH : C_BODY);
+        }
+}
+
+void render(uint16_t *fb, const Pose *p) {
+    int ox = p->dx, oy = p->dy;
+    int up = -p->stretch;                    // upper_dy
+    int top = -p->stretch;                   // hàng trên cùng của thân
+
+    fb_clear(fb, C_BG);
+
+    // 2. bóng đổ (không dịch theo dy)
+    int h = -p->dy, w = (h <= 1) ? 12 : (h <= 3) ? 10 : 8;
+    for (int i = 0; i < w; i++)
+        cell_fill(fb, CHAR_X + 3 + (12 - w) / 2 + i + p->dx, GROUND_ROW, C_SHADOW);
+
+    // 3. chân
+    for (int i = 0; i < 4; i++)
+        for (int r = 0; r < LEG_H(p->legs, i); r++)
+            cell_fill(fb, CHAR_X + ox + LEG_COL[i], CHAR_Y + oy + 8 + r, C_BODY_SH);
+
+    // 4. thân
+    for (int r = top; r <= 7; r++)
+        for (int c = 2; c <= 13; c++)
+            cell_fill(fb, CHAR_X + ox + c, CHAR_Y + oy + r,
+                      r == top ? C_BODY_HI : (r == 7 ? C_BODY_SH : C_BODY));
+
+    // 5. tay
+    draw_arm(fb, 1, p->aL_in, p->aL_dy + up, ox, oy);
+    draw_arm(fb, 0, p->aR_in, p->aR_dy + up, ox, oy);
+
+    // 6. má hồng
+    if (p->blush) {
+        for (int c = 3; c <= 4;  c++) cell_fill(fb, CHAR_X+ox+c, CHAR_Y+oy+4+up, C_PINK);
+        for (int c = 11; c <= 12; c++) cell_fill(fb, CHAR_X+ox+c, CHAR_Y+oy+4+up, C_PINK);
+    }
+
+    // 7. mắt (xem eye_draw(): chọn bitmap theo EyeId, áp eyeDx/eyeDy, màu theo eyeColor)
+    eye_draw(fb, p->eyeL, 0, CHAR_X + ox + 3,  CHAR_Y + oy + 1 + up, p);
+    eye_draw(fb, p->eyeR, 1, CHAR_X + ox + 10, CHAR_Y + oy + 1 + up, p);   // flipX = 1
+
+    // 8. miệng
+    mouth_draw(fb, p->mouth, CHAR_X + ox + 6, CHAR_Y + oy + 4 + up);
+
+    // 9. FX
+    fx_draw(fb, p->fx);
+}
+```
+
+### 12.5 Double buffer + VSYNC (chống xé hình)
+
+```c
+volatile uint8_t swap_pending = 0;
+
+void present(void) {
+    HAL_LTDC_SetAddress_NoReload(&hltdc, (uint32_t)back, LTDC_LAYER_1);
+    HAL_LTDC_Reload(&hltdc, LTDC_RELOAD_VERTICAL_BLANKING);   // nạp địa chỉ mới ở VBLANK
+    swap_pending = 1;
+}
+
+void HAL_LTDC_ReloadEventCallback(LTDC_HandleTypeDef *h) {   // gọi khi reload xong
+    if (swap_pending) {
+        uint16_t *t = front; front = back; back = t;
+        swap_pending = 0;
+    }
+}
+```
+
+Đợi `swap_pending == 0` trước khi vẽ frame tiếp theo. (Kiểm tra tên hàm HAL theo phiên bản CubeF4 bạn dùng.)
+
+### 12.6 Vòng lặp chính
+
+```c
+int main(void) {
+    HAL_Init(); SystemClock_Config();
+    lcd_init();                                   // mục 12.2
+    front = (uint16_t *)FB0_ADDR;
+    back  = (uint16_t *)FB1_ADDR;
+
+    anim_play(&ANIM_BOOT);
+    uint32_t last = 0;
+
+    while (1) {
+        uint32_t now = HAL_GetTick();
+        if (now - last >= 33 && !swap_pending) {      // ~30 FPS
+            last = now;
+            Pose p = *anim_tick(now);                 // pose hiện tại của animation
+            overlay_blink(&p, now);                   // chớp mắt
+            overlay_look(&p, now);                    // nhìn quanh
+            fx_update(now);
+            render(back, &p);
+            present();
+        }
+        input_poll();                                 // nút PA0, touch, gyro
+    }
+}
+```
+
+### 12.7 Engine animation tối giản
+
+```c
+typedef struct { const Pose *f; uint8_t n; uint8_t loop; uint8_t prio; } Anim;
+
+static const Anim *cur;
+static uint8_t  idx;
+static uint32_t t_next;
+
+void anim_play(const Anim *a) {
+    if (cur && a->prio < cur->prio) return;       // không ngắt mức cao hơn
+    cur = a; idx = 0; t_next = HAL_GetTick() + a->f[0].ms;
+}
+
+const Pose *anim_tick(uint32_t now) {
+    if (now >= t_next) {
+        if (++idx >= cur->n) {
+            if (cur->loop) idx = 0;
+            else { cur = &ANIM_IDLE; idx = 0; }   // về idle / emotion nền
+        }
+        t_next = now + cur->f[idx].ms;
+    }
+    return &cur->f[idx];
+}
+```
+
+### 12.8 Ví dụ khai báo animation
+
+```c
+#define LEGS(a,b,c,d) ((a)|((b)<<2)|((c)<<4)|((d)<<6))
+#define BASE .legs = LEGS(2,2,2,2), .eyeL = EYE_NORMAL, .eyeR = EYE_NORMAL, .mouth = MOUTH_NONE
+
+static const Pose WAVE_F[] = {
+    { BASE, .eyeL=EYE_HAPPY, .eyeR=EYE_HAPPY, .mouth=MOUTH_SMILE, .blush=1, .aR_in=0,  .aR_dy=-1, .ms=100 },
+    { BASE, .eyeL=EYE_HAPPY, .eyeR=EYE_HAPPY, .mouth=MOUTH_SMILE, .blush=1, .aR_in=0,  .aR_dy=-2, .ms=140 },
+    { BASE, .eyeL=EYE_HAPPY, .eyeR=EYE_HAPPY, .mouth=MOUTH_SMILE, .blush=1, .aR_in=-1, .aR_dy=-3, .ms=140 },
+    { BASE, .eyeL=EYE_HAPPY, .eyeR=EYE_HAPPY, .mouth=MOUTH_SMILE, .blush=1, .aR_in=0,  .aR_dy=-2, .ms=140 },
+    { BASE, .eyeL=EYE_HAPPY, .eyeR=EYE_HAPPY, .mouth=MOUTH_SMILE, .blush=1, .aR_in=-1, .aR_dy=-3, .ms=140 },
+    { BASE, .eyeL=EYE_HAPPY, .eyeR=EYE_HAPPY, .mouth=MOUTH_SMILE, .blush=1, .aR_in=0,  .aR_dy=-1, .ms=100 },
+};
+static const Anim ANIM_WAVE = { WAVE_F, 6, 0, 2 };
+
+static const Pose WALK_F[] = {
+    { BASE, .legs=LEGS(1,2,1,2), .aL_dy=+1, .aR_dy=-1, .ms=110 },
+    { BASE, .dy=-1,                                      .ms=110 },
+    { BASE, .legs=LEGS(2,1,2,1), .aL_dy=-1, .aR_dy=+1, .ms=110 },
+    { BASE, .dy=-1,                                      .ms=110 },
+};
+static const Anim ANIM_WALK = { WALK_F, 4, 1, 2 };
+```
+
+### 12.9 Hiệu năng
+
+- Mỗi frame: xóa 76 800 px + vẽ tối đa ~250 ô × 144 px ≈ 36 000 px. Ghi trực tiếp vào SDRAM bằng CPU 180 MHz đủ cho 30 FPS.
+- **Tối ưu nếu cần:** (1) xóa nền bằng DMA2D (chế độ R2M), (2) chỉ xóa/vẽ lại hình chữ nhật chứa nhân vật (khoảng hàng 2..22), (3) tiền render từng bộ phận thành bitmap RGB565 12×-scale rồi `memcpy`/DMA2D M2M.
+
+---
+
+## 13. Kế hoạch kiểm thử
+
+Dùng các thiết bị có sẵn trên board để test nhanh:
+
+| Đầu vào              | Công dụng khi test                                                                           |
+| -------------------- | -------------------------------------------------------------------------------------------- |
+| **Nút PA0**          | Mỗi lần nhấn: chuyển biểu cảm kế tiếp (NEUTRAL → HAPPY → ...); nhấn giữ: chạy action kế tiếp |
+| **Touch (STMPE811)** | Chạm nhân vật → POKE                                                                         |
+| **Gyro (L3GD20)**    | Lắc mạnh board → DIZZY                                                                       |
+| **LED PG13**         | Toggle mỗi frame, đo FPS bằng oscilloscope/logic analyzer                                    |
+
+### Checklist theo giai đoạn
+
+- [ ] **Giai đoạn 1, màu sắc:** tô thử từng màu trong bảng, kiểm tra thân tím đọc rõ trên nền tối.
+- [ ] **Giai đoạn 2, sprite tĩnh:** vẽ NEUTRAL, so sánh với sơ đồ ASCII mục 2.2 (16×10, thân 12×8, chân ở cột 3/5/10/12).
+- [ ] **Giai đoạn 3, bộ phận:** nhấn nút duyệt từng loại mắt, miệng, tư thế tay, chân, kiểm tra lật ngang mắt phải.
+- [ ] **Giai đoạn 4, biểu cảm:** chạy lần lượt 16 biểu cảm ở mục 8, chỉ nhìn mắt + miệng đã phân biệt được cảm xúc chưa.
+- [ ] **Giai đoạn 5, hành động:** IDLE, BLINK, WAVE, WALK, JUMP, DANCE, kiểm tra nhịp, squash/stretch, bóng đổ.
+- [ ] **Giai đoạn 6, FX:** tim, Zzz, `?`, `!`, nước mắt, sóng âm không chồng lên nhân vật sai chỗ hoặc tràn màn hình.
+- [ ] **Giai đoạn 7, hiệu năng:** đạt ≥ 30 FPS, không xé hình (VSYNC), không nhấp nháy.
+- [ ] **Giai đoạn 8, tích hợp:** state machine với mức ưu tiên, giả lập sự kiện AI (LISTENING → THINKING → SPEAKING) bằng nút bấm/UART.
+- [ ] **Đánh giá "cute":** nhìn thử 5 giây xem nhân vật có "sống" không; nếu cứng thì tăng squash/stretch, thêm overshoot, thêm chớp mắt/nhìn quanh.
+
+---
+
+## 14. Hướng mở rộng
+
+- Thêm chuyển cảnh mượt giữa các biểu cảm (1 frame trung gian: mắt HALF hoặc squash).
+- Bảng **emotion → animation** điều khiển từ UART/USB/BLE để AI gửi lệnh `emotion=happy action=wave`.
+- Nói nhép theo **viseme** từ TTS; đồng bộ DANCE với **beat detection**.
+- Thêm phụ kiện: tai nghe, ăng-ten, kính, nón (bộ phận mới ở lớp trên cùng).
+- Landscape + nền cảnh (mặt đất cuộn, đám mây pixel) để nhân vật đi/chạy thật.
+- Chuyển render sang **DMA2D** + bitmap dựng sẵn để giải phóng CPU cho xử lý âm thanh.
